@@ -37,6 +37,10 @@ jobs:
   build-windows:
     needs: test
     runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -50,22 +54,41 @@ jobs:
           New-Item -ItemType Directory -Force bundle | Out-Null
           Copy-Item $real.FullName bundle\wget.exe
           bundle\wget.exe --version | Select-Object -First 1
-      - name: Build wgmdownloader.exe
+      # PyInstaller is pinned and installed from its source release, which compiles the
+      # launcher here instead of using the prebuilt one shared by every PyInstaller app (0011).
+      - name: Install PyInstaller with a launcher built from source
+        shell: pwsh
+        env:
+          PYINSTALLER_COMPILE_BOOTLOADER: "1"
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --no-binary pyinstaller pyinstaller==6.22.3
+      - name: Build the wgmdownloader folder
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip pyinstaller
-          pyinstaller --noconfirm --onefile --console --name wgmdownloader `
+          pyinstaller --noconfirm --onedir --console --name wgmdownloader `
             --add-binary "bundle\wget.exe;." wget_gui.py
-          Get-Item dist\wgmdownloader.exe | Select-Object Name, Length
-      - name: Smoke-test the executable
-        run: python ci/smoke_test.py dist/wgmdownloader.exe
-      - name: Third-party notices
-        run: python ci/notices.py bundle/wget.exe dist/THIRD_PARTY_NOTICES.txt
+          python ci/notices.py bundle/wget.exe dist/wgmdownloader/THIRD_PARTY_NOTICES.txt
+          Copy-Item dist\wgmdownloader\THIRD_PARTY_NOTICES.txt dist\THIRD_PARTY_NOTICES.txt
+          python ci/package.py dist/wgmdownloader dist/wgmdownloader-windows.zip
+          Get-Item dist\wgmdownloader-windows.zip, dist\wgmdownloader\wgmdownloader.exe | Select-Object Name, Length
+      - name: Smoke-test the unzipped program
+        shell: pwsh
+        run: |
+          python -m zipfile -e dist/wgmdownloader-windows.zip unzipped
+          python ci/smoke_test.py unzipped/wgmdownloader/wgmdownloader.exe
+      - name: Attest the build
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/wgmdownloader-windows.zip
+            dist/wgmdownloader/wgmdownloader.exe
       - uses: actions/upload-artifact@v4
         with:
           name: wgmdownloader-windows
           path: |
-            dist/wgmdownloader.exe
+            dist/wgmdownloader-windows.zip
             dist/THIRD_PARTY_NOTICES.txt
           if-no-files-found: error
 
@@ -103,5 +126,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
-          gh release create "$TAG" dist/wgmdownloader.exe dist/THIRD_PARTY_NOTICES.txt \
+          gh release create "$TAG" dist/wgmdownloader-windows.zip dist/THIRD_PARTY_NOTICES.txt \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "WGMDownloader $TAG" --generate-notes

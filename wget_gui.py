@@ -365,7 +365,10 @@ def picker_commands(initial):
     if os.name == "nt":
         if tk:
             cmds.append(tk)            # modern Explorer dialog
-        ps = shutil.which("powershell") or shutil.which("pwsh")
+        # PowerShell is only a fallback for running from source without Tk. The executable
+        # bundles Tk, and antivirus models score programs that start PowerShell as
+        # suspicious, so the executable never starts it (see 0011).
+        ps = None if FROZEN else shutil.which("powershell") or shutil.which("pwsh")
         if ps:
             cmds.append(([ps, "-NoProfile", "-NonInteractive", "-STA", "-Command", PICKER_PS], None, None))
     elif sys.platform == "darwin":

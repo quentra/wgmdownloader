@@ -733,6 +733,17 @@ class PackagingTest(unittest.TestCase):
         for argv, _, _ in tk:
             self.assertEqual(argv[-2:], ["--pick-folder", "/start"])
 
+    def test_frozen_never_offers_powershell(self):
+        orig = wget_gui.FROZEN
+        wget_gui.FROZEN = True
+        try:
+            cmds = wget_gui.picker_commands("/start")
+        finally:
+            wget_gui.FROZEN = orig
+        for argv, _, _ in cmds:
+            self.assertNotIn("powershell", os.path.basename(argv[0]).lower())
+            self.assertNotIn("pwsh", os.path.basename(argv[0]).lower())
+
     def test_frozen_wget_lookup_prefers_next_to_exe_then_bundled(self):
         d = tempfile.mkdtemp(prefix="wget-gui-frozen-")
         self.addCleanup(shutil.rmtree, d, True)

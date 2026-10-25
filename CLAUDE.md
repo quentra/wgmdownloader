@@ -2,13 +2,13 @@
 
 Minimal local frontend for wget: URL + folder (typed or chosen with the system folder dialog) + file types; jobs with an overall progress bar and per-file rows (name, bar, size, speed, pause/resume/retry); "Compare with folder", which lists remote files missing or incomplete locally, with their sizes, and downloads them; a parallel-downloads stepper.
 
-Architecture: one stdlib-only Python file (`wget_gui.py`) runs a localhost HTTP server with an inline HTML page. Each job scans with `wget --spider` to list files, then each file is fetched by its own `wget --continue` process under a global parallel limit. Released as `wgmdownloader.exe` (PyInstaller one-file, wget bundled), built by GitHub Actions.
+Architecture: one stdlib-only Python file (`wget_gui.py`) runs a localhost HTTP server with an inline HTML page. Each job scans with `wget --spider` to list files, then each file is fetched by its own `wget --continue` process under a global parallel limit. Released as `wgmdownloader-windows.zip`: a PyInstaller folder build (`wgmdownloader/wgmdownloader.exe` plus `_internal/`, wget bundled), built by GitHub Actions with a pinned PyInstaller whose launcher is compiled from source, and attested.
 
 ## Run / test
 - Run: `python wget_gui.py` (opens http://127.0.0.1:8765/); `--port N`, `--no-browser`
 - Test: `python -m unittest -v test_wget_gui` (needs wget; uses a local HTTP/1.1 fixture server)
 - Check which wget is used: `python wget_gui.py --check`
-- Build/release: `.github/workflows/build.yml` runs the tests on Ubuntu and Windows, builds the exe on windows-latest, then runs `ci/smoke_test.py dist/wgmdownloader.exe`. To release, bump `VERSION` on main (the workflow publishes `v<VERSION>` if that release doesn't exist yet) or push a tag `vX.Y.Z`. It can't be built locally from Linux (PyInstaller doesn't cross-compile).
+- Build/release: `.github/workflows/build.yml` runs the tests on Ubuntu and Windows, builds on windows-latest, zips with `ci/package.py`, then runs `ci/smoke_test.py` on the unzipped program. To release, bump `VERSION` on main (the workflow publishes `v<VERSION>` if that release doesn't exist yet) or push a tag `vX.Y.Z`. It can't be built locally from Linux (PyInstaller doesn't cross-compile).
 
 ## Hard constraints
 - Stdlib only; a single file. No frameworks, and no build step for the script itself.
@@ -24,6 +24,7 @@ Architecture: one stdlib-only Python file (`wget_gui.py`) runs a localhost HTTP 
 - Scans run with `--no-directories` so temp paths stay short (Windows 260-char limit). A scan that errors after finding files is "done" with a note carrying wget's message; with nothing found it is "failed".
 - Folder matching (`_classify`): file at the path a download would use counts as in the folder, or as incomplete if smaller. Otherwise any file under the folder with the same name (case-insensitive) and the same known size counts, which also covers the pre-0005 full-path layout. Same name with a different or unknown size is missing.
 - Broken links: `job.broken_links` (url + status), shown via `files?status=broken`; replaced on each scan.
-- The folder dialog runs on this machine via `pick_folder()` (tkinter or PowerShell on Windows, osascript on macOS, zenity/kdialog/tkinter on Linux). Tests replace `picker_commands`; never open a real dialog in tests.
+- Antivirus false positives (0011): keep the folder build (no one-file), the source-built launcher and the pinned PyInstaller; the executable never starts PowerShell. Bump the pin deliberately.
+- The folder dialog runs on this machine via `pick_folder()` (tkinter on Windows, plus PowerShell when running from source, osascript on macOS, zenity/kdialog/tkinter on Linux). Tests replace `picker_commands`; never open a real dialog in tests.
 - Licence: GPL-3.0-or-later (LICENSE, SPDX header in wget_gui.py). Keep example paths and fixtures generic: no names or paths from real archives a user downloaded.
 - Simplicity is the brief: add features only on request.

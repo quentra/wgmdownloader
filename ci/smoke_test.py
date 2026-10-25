@@ -1,6 +1,8 @@
 """Black-box test of the built executable.
 
-Usage: python ci/smoke_test.py dist/wgmdownloader.exe
+Usage: python ci/smoke_test.py unzipped/wgmdownloader/wgmdownloader.exe
+
+CI runs it on the program unzipped from the release zip, so it tests what users get.
 
 PATH is cut down to the system folder, so the program must use the wget bundled inside it.
 Checks: --check reports a working wget; the page is served; a comparison against an empty

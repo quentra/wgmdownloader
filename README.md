@@ -13,8 +13,12 @@ Other features include:
 - **Check for new files**: picks up files added to the server since the last run.
 - **Folder structure kept**: files are saved under your folder in the same subfolders as on the server, starting from the URL you entered.
 - **Browse button**: choose the target folder with your system's folder window.
-- **Self-contained**: a single executable with wget built in. The interface opens in your browser and is only reachable from your own computer.
+- **Self-contained**: unzip and run `wgmdownloader.exe`; wget is built in, nothing to install. The interface opens in your browser and is only reachable from your own computer.
 - **Light and dark mode**: follows your system setting.
+
+## Download
+
+Get `wgmdownloader-windows.zip` from [Releases](../../releases/latest), unzip it anywhere and run `wgmdownloader\wgmdownloader.exe`. Each release is built by this repository's GitHub Actions workflow and carries a build attestation: `gh attestation verify wgmdownloader-windows.zip --repo quentra/wgmdownloader`. On Linux or macOS, run `python3 wget_gui.py` with wget installed.
 
 ## License
 

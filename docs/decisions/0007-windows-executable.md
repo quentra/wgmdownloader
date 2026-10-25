@@ -2,6 +2,8 @@
 
 Date: 2026-10-25
 
+Packaging (one file) superseded by 0011; the rest stands.
+
 ## Decision
 The app is distributed as `wgmdownloader.exe`: `wget_gui.py` frozen with PyInstaller (one file, console window), with wget bundled inside. GitHub Actions builds it on `windows-latest`, because PyInstaller can't cross-compile. A release with the exe and `THIRD_PARTY_NOTICES.txt` is published when `VERSION` on main names a version that has no release yet, or when a `v*` tag is pushed. (The VERSION route exists because the environment this was built from couldn't push tags.)
 
