@@ -126,6 +126,23 @@ class WgetGuiTest(unittest.TestCase):
             "intl/Za\u017c\u00f3\u0142\u0107/g\u0119\u015bl\u0105 ja\u017a\u0144.pdf": b"p" * 321,
             "intl/\u00fc \u041a\u0438\u0457\u0432.pdf": b"k" * 222,
         }
+        # Links written with raw (unescaped) UTF-8 characters, as many real servers do.
+        files["rawlinks/index.html"] = ('<a href="Genevi\u00e8ve.pdf">1</a> <a href="It\u2019s.pdf">2</a> '
+                                        '<a href="\u6587\u4ef6/">3</a>').encode("utf-8")
+        files["rawlinks/Genevi\u00e8ve.pdf"] = b"g" * 111
+        files["rawlinks/It\u2019s.pdf"] = b"i" * 222
+        files["rawlinks/\u6587\u4ef6/inner.pdf"] = b"n" * 333
+        # Links already garbled the way Windows wget garbles them (UTF-8 re-read as
+        # Windows-1252): the server answers 404, and the app must find the real files.
+        files["mangled/index.html"] = (b'<a href="Genevi%C3%83%C2%A8ve.pdf">1</a> '
+                                       b'<a href="It%C3%A2%E2%82%AC%E2%84%A2s.pdf">2</a> '
+                                       b'<a href="%C3%A6%E2%80%93%E2%80%A1%C3%A4%C2%BB%C2%B6/">3</a> '
+                                       b'<a href="plain.pdf">4</a> <a href="gon%C3%83%C2%A8.pdf">5</a>')
+        files["mangled/Genevi\u00e8ve.pdf"] = b"g" * 111
+        files["mangled/It\u2019s.pdf"] = b"i" * 222
+        files["mangled/\u6587\u4ef6/inner.pdf"] = b"n" * 333
+        files["mangled/\u6587\u4ef6/Za\u017c\u00f3\u0142\u0107.pdf"] = b"z" * 555
+        files["mangled/plain.pdf"] = b"p" * 444
         for i in range(6):
             files["many/f%d.pdf" % i] = os.urandom(512 * 1024)
         for i in range(4):
@@ -302,6 +319,31 @@ class WgetGuiTest(unittest.TestCase):
                                                "\u00fc \u041a\u0438\u0457\u0432.pdf"})
         cmp_id = self.new_job("compare", "/intl/", t)
         self.assertEqual(self.wait_status(cmp_id, "done")["counts"], {"local": 2})
+
+    def test_raw_utf8_links_are_found(self):
+        jid = self.new_job("compare", "/rawlinks/", self.target("t-raw"))
+        j = self.wait_status(jid, "done", "failed")
+        self.assertEqual((j["files_total"], j["broken"]), (3, 0), self.files(jid)["log"][-12:])
+        self.assertEqual({f["path"] for f in self.files(jid)["files"]},
+                         {"Genevi\u00e8ve.pdf", "It\u2019s.pdf", "\u6587\u4ef6/inner.pdf"})
+
+    def test_garbled_links_are_repaired_found_and_downloaded(self):
+        t = self.target("t-mangled")
+        jid = self.new_job("compare", "/mangled/", t)
+        j = self.wait_status(jid, "done", "failed", timeout=60)
+        log = self.files(jid)["log"]
+        paths = {f["path"] for f in self.files(jid)["files"]}
+        self.assertEqual(paths, {"Genevi\u00e8ve.pdf", "It\u2019s.pdf", "plain.pdf", "\u6587\u4ef6/inner.pdf",
+                                 "\u6587\u4ef6/Za\u017c\u00f3\u0142\u0107.pdf"}, log[-15:])
+        self.assertEqual(j["bytes_total"], 111 + 222 + 333 + 555 + 444)
+        broken = self.files(jid, "broken")["links"]
+        self.assertEqual([(b["path"], b["status"][:3]) for b in broken], [("gon\u00e8.pdf", "404")],
+                         "a link that fails even with its name corrected stays broken, under its real name")
+        self.assertTrue(any("names corrected and retried" in l for l in log))
+        self.call("/api/jobs/%d/download" % jid, {})
+        j = self.wait_status(jid, "done", timeout=30)
+        self.assertEqual(j["counts"], {"done": 5})
+        self.assertEqual(self.files_under(t), paths)
 
     def test_complete_file_at_its_path_is_skipped_without_a_request(self):
         t = self.target("t-skip")
@@ -807,6 +849,11 @@ class PickerTest(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+def unquote_path(url):
+    from urllib.parse import unquote, urlparse
+    return unquote(urlparse(url).path)
+
+
 class ParserTest(unittest.TestCase):
     def test_spider_url_line_including_retries(self):
         r = wget_gui.SPIDER_URL_RE
@@ -845,6 +892,19 @@ class ParserTest(unittest.TestCase):
         self.assertEqual(pt("tar.gz; zip"), ["tar.gz", "zip"])
         with self.assertRaises(ValueError):
             pt("pdf;rm -rf")
+
+    def test_unmangle_url(self):
+        u = wget_gui.unmangle_url
+        fix = lambda url: unquote_path(u(url))
+        self.assertEqual(fix("https://h/a/Vampire%20Genevi%C3%83%C2%A8ve/"), "/a/Vampire Genevi\u00e8ve/")
+        self.assertEqual(fix("https://h/a/It%C3%A2%E2%82%AC%E2%84%A2s%20Your%20Funeral.pdf"), "/a/It\u2019s Your Funeral.pdf")
+        self.assertEqual(fix("https://h/b/R_E_R_F%C3%A6%E2%80%93%E2%80%A1%C3%A4%C2%BB%C2%B6/"), "/b/R_E_R_F\u6587\u4ef6/")
+        self.assertEqual(fix("https://h/a/Kh%C3%83%C2%A2rn.txt"), "/a/Kh\u00e2rn.txt")
+        self.assertEqual(fix("https://h/G%C3%83%C2%A8ve/x/It%C3%A2%E2%82%AC%E2%84%A2s.pdf"), "/G\u00e8ve/x/It\u2019s.pdf")
+        for fine in ("https://h/a/Genevi%C3%A8ve/", "https://h/plain/file.pdf",
+                     "https://h/a/Za%C5%BC%C3%B3%C5%82%C4%87.pdf", "https://h/a/%E6%96%87%E4%BB%B6/"):
+            self.assertIsNone(u(fine), fine)
+        self.assertTrue(u("https://h/a/Genevi%C3%83%C2%A8ve.pdf").startswith("https://h/a/"))
 
     def test_safe_name(self):
         sn = wget_gui.safe_name

@@ -33,7 +33,7 @@ import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse, urlunparse
 
 LIMIT_MIN, LIMIT_MAX, LIMIT_DEFAULT = 1, 10, 3
 
@@ -201,6 +201,49 @@ def parse_types(text):
         if token not in out:
             out.append(token)
     return out
+
+
+# Windows-1252 leaves these five bytes undefined; Windows maps them to the matching C1 controls.
+_CP1252_UNDEFINED = {0x81, 0x8D, 0x8F, 0x90, 0x9D}
+REPAIR_LIMIT = 2000      # corrected-URL retries per scan, a guard against pathological listings
+
+
+def _cp1252_bytes(text):
+    out = bytearray()
+    for ch in text:
+        o = ord(ch)
+        if o < 0x80 or o in _CP1252_UNDEFINED:
+            out.append(o)
+        else:
+            try:
+                out += ch.encode("cp1252")
+            except UnicodeEncodeError:
+                return None
+    return bytes(out)
+
+
+def unmangle_url(url):
+    """Windows wget can request a link's UTF-8 name re-read as Windows-1252 and encoded again
+    (è → Ã¨, ’ → â€™), which the server answers with 404. Return the URL with such path
+    segments put right, or None if nothing in it looks garbled that way."""
+    p = urlparse(url)
+    changed = False
+    segments = []
+    for seg in p.path.split("/"):
+        text = unquote(seg)
+        raw = _cp1252_bytes(text)
+        fixed = None
+        if raw is not None and any(b >= 0x80 for b in raw):
+            try:
+                fixed = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                fixed = None
+        if fixed and fixed != text:
+            segments.append(quote(fixed, safe="!$&'()*+,;=:@~"))
+            changed = True
+        else:
+            segments.append(seg)
+    return urlunparse(p._replace(path="/".join(segments))) if changed else None
 
 
 def fmt_size(n):
@@ -411,6 +454,8 @@ class Job:
         self.broken_links = []        # [{"url", "status"}] from the latest scan
         self.broken_seen = set()
         self.scan_errors = []         # wget's messages when a scan ends with an error
+        self.repair_queue = []        # corrected URLs still to scan (see unmangle_url)
+        self.repair_tried = set()
         self.log = collections.deque(maxlen=2000)
         path = urlparse(url).path or "/"
         self.base = unquote(path if path.endswith("/") else path.rsplit("/", 1)[0] + "/")
@@ -539,14 +584,17 @@ class App:
 
     # ---- scanning ----
 
-    def _start_scan(self, job):
+    def _start_scan(self, job, url=None):
+        """Scan the job's URL; with `url`, a follow-up scan of a corrected link that adds to
+        what the job already found."""
         if job.scan_proc and job.scan_proc.poll() is None:
             return
+        primary = url is None
         tmp = tempfile.mkdtemp(prefix="wget-gui-scan-")
         cmd = [self.wget] + SCAN_ARGS
         if job.types:
             cmd += ["--accept", ",".join(job.types)]
-        cmd.append(job.url)
+        cmd.append(url or job.url)
         try:
             proc = popen(cmd, cwd=tmp)        # pages land in tmp without passing its path to wget
         except OSError:
@@ -556,20 +604,23 @@ class App:
         job.scan_proc = proc
         job.scan_state = "scanning"
         job.scan_stop_requested = False
-        job.scan_reason = ""
-        job.broken = 0
-        job.broken_links = []
-        job.broken_seen = set()
-        job.scan_errors = []
-        threading.Thread(target=self._scan_reader, args=(job, proc, tmp), daemon=True).start()
+        if primary:
+            job.scan_reason = ""
+            job.broken = 0
+            job.broken_links = []
+            job.broken_seen = set()
+            job.scan_errors = []
+            job.repair_queue = []
+            job.repair_tried = set()
+        threading.Thread(target=self._scan_reader, args=(job, proc, tmp, primary), daemon=True).start()
 
     def _stop_scan(self, job):
         if job.scan_proc and job.scan_proc.poll() is None:
             job.scan_stop_requested = True
             terminate(job.scan_proc)
 
-    def _scan_reader(self, job, proc, tmp):
-        if job.check_local:
+    def _scan_reader(self, job, proc, tmp, primary=True):
+        if primary and job.check_local:
             exists, index = build_index(job.target)
             with self.lock:
                 job.folder_exists, job.index = exists, index
@@ -596,7 +647,12 @@ class App:
                 if "does not contain any link" in line:
                     self._add_file(job, cur_url, cur_len)
                 elif "Remote file does not exist" in line:
-                    if cur_url and cur_url not in job.broken_seen:
+                    fixed = unmangle_url(cur_url) if cur_url else None
+                    if fixed and fixed not in job.repair_tried and len(job.repair_tried) < REPAIR_LIMIT:
+                        job.repair_tried.add(fixed)
+                        job.repair_queue.append((fixed, cur_url, cur_status))
+                        job.log.append("Retrying with the name corrected: %s" % fixed)
+                    elif cur_url and cur_url not in job.broken_seen:
                         job.broken_seen.add(cur_url)
                         job.broken_links.append({"url": cur_url, "status": cur_status})
                         job.broken = len(job.broken_links)
@@ -616,9 +672,10 @@ class App:
             if job.scan_proc is proc:
                 if job.scan_stop_requested:
                     job.scan_state = "stopped"
+                    job.repair_queue = []
                 elif rc in (0, 8):        # 8 = some broken links, still a complete scan
                     job.scan_state = "done"
-                elif job.files:
+                elif job.files or not primary:
                     # wget carried on past the error; what it found stands, flagged as possibly incomplete
                     job.scan_state = "done"
                 else:
@@ -627,10 +684,21 @@ class App:
                     if job.scan_errors:
                         why += " (%s)" % job.scan_errors[-1]
                     job.scan_reason = "Scan failed: " + why
+                while job.scan_state == "done" and job.repair_queue:
+                    fixed, original, status = job.repair_queue.pop(0)
+                    try:
+                        self._start_scan(job, url=fixed)
+                        self.wake.set()
+                        return                     # this scan's reader carries on from here
+                    except OSError:
+                        job.broken_seen.add(original)
+                        job.broken_links.append({"url": original, "status": status})
+                        job.broken = len(job.broken_links)
                 known = sum(f.size for f in job.files if f.size is not None)
-                job.log.append("Scan %s: %d files, %s, %d broken links, file types: %s" % (
+                job.log.append("Scan %s: %d files, %s, %d broken links, %d names corrected and retried, file types: %s" % (
                     {"stopped": "stopped", "failed": "failed"}.get(job.scan_state, "finished"),
-                    len(job.files), fmt_size(known), job.broken, ", ".join(job.types) or "all"))
+                    len(job.files), fmt_size(known), job.broken, len(job.repair_tried),
+                    ", ".join(job.types) or "all"))
         self.wake.set()
 
     def _add_file(self, job, url, size):
