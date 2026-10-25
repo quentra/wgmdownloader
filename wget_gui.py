@@ -85,6 +85,7 @@ SCAN_ERROR_RE = re.compile(r"^(Cannot write to .*|.*failed: .*|Unable to establi
 WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {"COM%d" % i for i in range(1, 10)} \
     | {"LPT%d" % i for i in range(1, 10)}
 SCAN_LOG_SKIP = ("Spider mode enabled", "Connecting to", "HTTP request sent", "Removing ",
+                 "Remote file exists and could contain",
                  "unlink:", "Saving to:", "Remote file exists", "Length:")
 
 
@@ -209,6 +210,19 @@ def parse_types(text):
         if token not in out:
             out.append(token)
     return out
+
+
+def is_page_file(url, types):
+    """An HTML URL the scan read for links that is also a file to list: not a folder (trailing
+    slash) or a generated page (query), and matching the file types (wget's own --accept
+    doesn't stop it reading pages, so the filter is applied here)."""
+    if not url:
+        return False
+    p = urlparse(url)
+    if not p.path or p.path.endswith("/") or p.query:
+        return False
+    name = unquote(p.path.rsplit("/", 1)[-1]).lower()
+    return not types or any(name.endswith("." + t) for t in types)
 
 
 # Windows-1252 leaves these five bytes undefined; Windows maps them to the matching C1 controls.
@@ -699,6 +713,11 @@ class App:
             with self.lock:
                 if "does not contain any link" in line:
                     self._add_file(job, cur_url, cur_len)
+                elif "could contain links to other resources" in line:
+                    # wget reads HTML to follow its links but never reports it as a file. A page
+                    # that isn't a folder listing (no trailing slash, no query) is a file too.
+                    if is_page_file(cur_url, job.types):
+                        self._add_file(job, cur_url, cur_len)
                 elif "Remote file does not exist" in line:
                     fixed = unmangle_url(cur_url) if cur_url else None
                     if fixed and fixed not in job.repair_tried and len(job.repair_tried) < REPAIR_LIMIT:

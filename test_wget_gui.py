@@ -457,11 +457,16 @@ class WgetGuiTest(unittest.TestCase):
         j = self.wait_status(jid, "done", "failed")
         log = self.files(jid)["log"]
         self.assertEqual(j["broken"], 0, log[-10:])
-        self.assertTrue({"real name.pdf", "Saved_Page_files/logo.gif"}
-                        <= {f["path"] for f in self.files(jid)["files"]})
+        self.assertEqual({f["path"] for f in self.files(jid)["files"]},
+                         {"Saved Page.htm", "real name.pdf", "Saved_Page_files/logo.gif"})
         left = sorted(l.rsplit("/", 1)[-1] for l in log if l.startswith("Left out"))
         self.assertEqual(left, ["logo.gif", "old_name.pdf", "style.css"], log[-10:])
         self.assertTrue(any("3 dead links inside pages left out" in l for l in log), log[-3:])
+        self.call("/api/jobs/%d/download" % jid, {})
+        j = self.wait_status(jid, "done", timeout=30)
+        self.assertEqual(j["counts"], {"done": 3})
+        with open(os.path.join(self.target("t-pages"), "Saved Page.htm"), "rb") as fh:
+            self.assertEqual(fh.read(), open(os.path.join(self.root, "pages", "Saved Page.htm"), "rb").read())
 
     def test_scan_leaves_no_temp_files(self):
         before = {d for d in os.listdir(tempfile.gettempdir()) if d.startswith("wget-gui-scan-")}
@@ -923,6 +928,16 @@ class ParserTest(unittest.TestCase):
         self.assertEqual(pt("tar.gz; zip"), ["tar.gz", "zip"])
         with self.assertRaises(ValueError):
             pt("pdf;rm -rf")
+
+    def test_is_page_file(self):
+        f = wget_gui.is_page_file
+        self.assertTrue(f("http://h/a/House%20Rules.htm", []))
+        self.assertTrue(f("http://h/a/x.HTML", ["html"]))
+        self.assertFalse(f("http://h/a/x.htm", ["pdf"]))
+        self.assertFalse(f("http://h/a/", []), "a folder listing is not a file")
+        self.assertFalse(f("http://h/", []))
+        self.assertFalse(f("http://h/a/view.php?id=3", []), "a generated page is not a file")
+        self.assertFalse(f(None, []))
 
     def test_listing_helpers(self):
         page = "http://h/a%20b//c/"
