@@ -20,9 +20,15 @@ def main():
         gpl = f.read()
     if "GNU GENERAL PUBLIC LICENSE" not in gpl or "Version 3" not in gpl:
         sys.exit("LICENSE is not the GPL v3 text")
-    python_license = os.path.join(sys.base_prefix, "LICENSE.txt")
-    with open(python_license, encoding="utf-8", errors="replace") as f:
-        psf = f.read()
+    psf = None
+    for folder in (sys.base_prefix, sys.prefix, os.path.dirname(sys.executable)):
+        candidate = os.path.join(folder, "LICENSE.txt")
+        if os.path.isfile(candidate):
+            with open(candidate, encoding="utf-8", errors="replace") as f:
+                psf = f.read()
+            break
+    if psf is None:
+        psf = "Python Software Foundation License: https://docs.python.org/3/license.html\n"
     rule = "=" * 78
     with open(out, "w", encoding="utf-8", newline="\r\n") as f:
         f.write("wgmdownloader.exe bundles the following third-party software.\n\n")
