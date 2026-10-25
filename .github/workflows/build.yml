@@ -1,0 +1,107 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install wget (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install wget --no-progress -y
+          # Put the real wget.exe first on PATH, not Chocolatey's shim: terminating the shim
+          # would leave the real process running, which breaks the pause tests.
+          $real = Get-ChildItem C:\ProgramData\chocolatey\lib\wget -Recurse -Filter wget.exe | Select-Object -First 1
+          Split-Path $real.FullName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Unit and end-to-end tests
+        run: python ci/run_tests.py
+
+  build-windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Get wget (Chocolatey verifies the download's checksum)
+        shell: pwsh
+        run: |
+          choco install wget --no-progress -y
+          $real = Get-ChildItem C:\ProgramData\chocolatey\lib\wget -Recurse -Filter wget.exe | Select-Object -First 1
+          New-Item -ItemType Directory -Force bundle | Out-Null
+          Copy-Item $real.FullName bundle\wget.exe
+          bundle\wget.exe --version | Select-Object -First 1
+      - name: Build wgmdownloader.exe
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip pyinstaller
+          pyinstaller --noconfirm --onefile --console --name wgmdownloader `
+            --add-binary "bundle\wget.exe;." wget_gui.py
+          Get-Item dist\wgmdownloader.exe | Select-Object Name, Length
+      - name: Smoke-test the executable
+        run: python ci/smoke_test.py dist/wgmdownloader.exe
+      - name: Third-party notices
+        run: python ci/notices.py bundle/wget.exe dist/THIRD_PARTY_NOTICES.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wgmdownloader-windows
+          path: |
+            dist/wgmdownloader.exe
+            dist/THIRD_PARTY_NOTICES.txt
+          if-no-files-found: error
+
+  # Releases: push a tag vX.Y.Z, or change VERSION on main. A version that has no release yet
+  # is published from that commit (the release creates the tag).
+  release:
+    if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
+    needs: build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Decide the version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then tag="$GITHUB_REF_NAME"; else tag="v$(tr -d ' \r\n' < VERSION)"; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists; nothing to publish."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/download-artifact@v4
+        if: steps.version.outputs.publish == 'true'
+        with:
+          name: wgmdownloader-windows
+          path: dist
+      - name: Publish release
+        if: steps.version.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release create "$TAG" dist/wgmdownloader.exe dist/THIRD_PARTY_NOTICES.txt \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "WGMDownloader $TAG" --generate-notes
