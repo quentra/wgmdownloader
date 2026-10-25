@@ -32,8 +32,9 @@ import tempfile
 import threading
 import time
 import webbrowser
+from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote, unquote, urlparse, urlunparse
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse, urlunparse
 
 LIMIT_MIN, LIMIT_MAX, LIMIT_DEFAULT = 1, 10, 3
 
@@ -70,6 +71,13 @@ SCAN_ARGS = ["--spider", "--recursive", "--level=inf", "--no-parent", "--ignore-
 # garbles anything outside it (Polish, Cyrillic, ...), and can't take such paths as arguments.
 FILE_ARGS = ["--continue", "--no-iri", "--progress=dot:mega", "-e", "robots=off"]
 PARTIAL_DIR = ".wgm-partial"      # inside the target folder; removed when empty
+# The scan follows links inside every HTML file it meets, including web pages saved into an
+# archive, whose images and links often point at files that were never uploaded. A broken
+# link is only reported if its folder's listing links to it (see 0012); fetching a listing
+# takes one short wget run per folder, up to this many folders.
+LISTING_ARGS = ["--quiet", "--no-iri", "--timeout=30", "--tries=2", "-e", "robots=off",
+                "--output-document=-"]
+LISTING_LIMIT = 500
 SCAN_EXIT = {**WGET_EXIT, 3: "couldn't save a page while reading it"}
 # wget lines that explain why a scan ended with an error (404s are broken links, not errors)
 SCAN_ERROR_RE = re.compile(r"^(Cannot write to .*|.*failed: .*|Unable to establish SSL.*|"
@@ -147,11 +155,11 @@ def bind_to_app(proc):
         pass                                                        # best effort: never block a download
 
 
-def popen(cmd, cwd=None):
+def popen(cmd, cwd=None, stdout=subprocess.DEVNULL):
     kwargs = {}
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=stdout,
                             stderr=subprocess.PIPE, env=wget_env(), cwd=cwd, **kwargs)
     bind_to_app(proc)
     return proc
@@ -244,6 +252,46 @@ def unmangle_url(url):
         else:
             segments.append(seg)
     return urlunparse(p._replace(path="/".join(segments))) if changed else None
+
+
+class _Hrefs(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.hrefs = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self.hrefs.extend(v for k, v in attrs if k == "href" and v)
+
+
+def url_key(url):
+    """What two links to the same file have in common: the decoded path, single slashes."""
+    return re.sub(r"/+", "/", unquote(urlparse(url).path))
+
+
+def listing_keys(page_url, html):
+    """The url_key of every <a href> on a folder listing page (and of its repaired form)."""
+    p = _Hrefs()
+    try:
+        p.feed(html)
+        p.close()
+    except Exception:
+        pass
+    keys = set()
+    for h in p.hrefs:
+        u = urljoin(page_url, h)
+        keys.add(url_key(u))
+        fixed = unmangle_url(u)           # a garbled link that was scanned under its real name
+        if fixed:
+            keys.add(url_key(fixed))
+    return keys
+
+
+def parent_url(url):
+    """The folder a link sits in: its URL up to the last slash (a folder's own slash excluded)."""
+    p = urlparse(url)
+    path = p.path[:-1] if p.path.endswith("/") else p.path
+    return urlunparse(p._replace(path=path.rsplit("/", 1)[0] + "/", params="", query="", fragment=""))
 
 
 def fmt_size(n):
@@ -459,6 +507,7 @@ class Job:
         self.scan_errors = []         # wget's messages when a scan ends with an error
         self.repair_queue = []        # corrected URLs still to scan (see unmangle_url)
         self.repair_tried = set()
+        self.scan_gen = 0             # bumped by each new scan; stale listing checks are dropped
         self.log = collections.deque(maxlen=2000)
         path = urlparse(url).path or "/"
         self.base = unquote(path if path.endswith("/") else path.rsplit("/", 1)[0] + "/")
@@ -608,6 +657,7 @@ class App:
         job.scan_state = "scanning"
         job.scan_stop_requested = False
         if primary:
+            job.scan_gen += 1
             job.scan_reason = ""
             job.broken = 0
             job.broken_links = []
@@ -671,6 +721,7 @@ class App:
                     job.log.append(line)
         rc = proc.wait()
         shutil.rmtree(tmp, ignore_errors=True)
+        check = False
         with self.lock:
             if job.scan_proc is proc:
                 if job.scan_stop_requested:
@@ -697,11 +748,71 @@ class App:
                         job.broken_seen.add(original)
                         job.broken_links.append({"url": original, "status": status})
                         job.broken = len(job.broken_links)
-                known = sum(f.size for f in job.files if f.size is not None)
-                job.log.append("Scan %s: %d files, %s, %d broken links, %d names corrected and retried, file types: %s" % (
-                    {"stopped": "stopped", "failed": "failed"}.get(job.scan_state, "finished"),
-                    len(job.files), fmt_size(known), job.broken, len(job.repair_tried),
-                    ", ".join(job.types) or "all"))
+                check = job.scan_state == "done" and bool(job.broken_links)
+                if check:
+                    job.scan_state = "scanning"     # still busy: checking the broken links
+                    links, gen = list(job.broken_links), job.scan_gen
+                else:
+                    self._log_scan_end(job, 0)
+        if check:
+            self._check_broken(job, links, gen)
+        self.wake.set()
+
+    def _log_scan_end(self, job, dropped):
+        known = sum(f.size for f in job.files if f.size is not None)
+        job.log.append("Scan %s: %d files, %s, %d broken links, %d names corrected and retried, "
+                       "%d dead links inside pages left out, file types: %s" % (
+                           {"stopped": "stopped", "failed": "failed"}.get(job.scan_state, "finished"),
+                           len(job.files), fmt_size(known), job.broken, len(job.repair_tried), dropped,
+                           ", ".join(job.types) or "all"))
+
+    def _fetch_listing(self, job, url, gen):
+        """url_keys linked from the folder listing at `url`: an empty set if the server has no
+        such folder, None if it couldn't be checked (the link is then kept)."""
+        with self.lock:
+            if job.scan_gen != gen or job.scan_stop_requested:
+                return None
+            try:
+                proc = popen([self.wget] + LISTING_ARGS + [url], stdout=subprocess.PIPE)
+            except OSError:
+                return None
+            job.scan_proc = proc              # so Pause/Remove can stop it
+        out, _ = proc.communicate()
+        if proc.returncode == 8:              # the server answered with an error, e.g. 404
+            return set()
+        if proc.returncode != 0:
+            return None
+        return listing_keys(url, out.decode("utf-8", "replace"))
+
+    def _check_broken(self, job, links, gen):
+        """Keep the broken links that their folder's listing links to; leave out the rest,
+        which came from links inside downloaded pages."""
+        listings, keep, dropped = {}, [], []
+        for link in links:
+            listed = None
+            for cand in filter(None, (link["url"], unmangle_url(link["url"]))):
+                folder = parent_url(cand)
+                if folder not in listings:
+                    listings[folder] = (self._fetch_listing(job, folder, gen)
+                                        if len(listings) < LISTING_LIMIT else None)
+                keys = listings[folder]
+                if keys is None:
+                    listed = True             # couldn't check: keep it
+                    break
+                if url_key(cand) in keys:
+                    listed = True
+                    break
+                listed = False
+            (keep if listed else dropped).append(link)
+        with self.lock:
+            if job.scan_gen != gen:
+                return                        # a new scan started meanwhile
+            job.scan_state = "stopped" if job.scan_stop_requested else "done"
+            job.broken_links = keep
+            job.broken = len(keep)
+            for link in dropped:
+                job.log.append("Left out (not in its folder's listing): %s" % link["url"])
+            self._log_scan_end(job, len(dropped))
         self.wake.set()
 
     def _add_file(self, job, url, size):

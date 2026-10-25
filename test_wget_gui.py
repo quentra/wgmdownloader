@@ -122,6 +122,14 @@ class WgetGuiTest(unittest.TestCase):
             "broken/index.html": b'<a href="ok.pdf">ok</a> <a href="gone.pdf">gone</a> '
                                  b'<a href="sub/lost%20file.pdf">lost</a> <a href="nodir/">nodir</a>',
             "broken/ok.pdf": b"o" * 500,
+            # A web page saved into an archive: its images and one of its links point at files
+            # that were never uploaded (the folder was renamed with underscores). Those are not
+            # broken links of the archive; only what a folder listing links to counts.
+            "pages/Saved Page.htm": b'<img src="Saved%20Page_files/logo.gif"> '
+                                    b'<link rel="stylesheet" href="Saved%20Page_files/style.css"> '
+                                    b'<a href="old_name.pdf">old</a> <a href="real%20name.pdf">real</a>',
+            "pages/real name.pdf": b"r" * 600,
+            "pages/Saved_Page_files/logo.gif": b"l" * 60,
             "flaky/x.pdf": b"f" * 700,
             "intl/Za\u017c\u00f3\u0142\u0107/g\u0119\u015bl\u0105 ja\u017a\u0144.pdf": b"p" * 321,
             "intl/\u00fc \u041a\u0438\u0457\u0432.pdf": b"k" * 222,
@@ -428,20 +436,32 @@ class WgetGuiTest(unittest.TestCase):
     def test_compare_lists_broken_links_with_server_response(self):
         jid = self.new_job("compare", "/broken/")
         j = self.wait_status(jid, "done", "failed")
-        self.assertEqual((j["files_total"], j["bytes_total"], j["broken"]), (1, 500, 3))
+        # sub/lost file.pdf: its folder doesn't exist, so no listing links to it (left out)
+        self.assertEqual((j["files_total"], j["bytes_total"], j["broken"]), (1, 500, 2))
         page = self.files(jid, "broken")
-        self.assertEqual(page["total"], 3)
+        self.assertEqual(page["total"], 2)
         self.assertEqual(page["files"], [])
         got = {l["path"]: l for l in page["links"]}
-        self.assertEqual(set(got), {"gone.pdf", "sub/lost file.pdf", "nodir/"})
+        self.assertEqual(set(got), {"gone.pdf", "nodir/"})
         self.assertTrue(got["gone.pdf"]["url"].endswith("/broken/gone.pdf"))
         for l in page["links"]:
             self.assertTrue(l["status"].startswith("404"), l)
         # paging, and a rescan replaces the list rather than adding to it
         self.assertEqual(len(self.call("/api/jobs/%d/files?status=broken&limit=2" % jid)[1]["links"]), 2)
         self.call("/api/jobs/%d/rescan" % jid, {})
-        wait_for(lambda: self.job(jid)["status"] == "done" and self.job(jid)["broken"] == 3, timeout=15)
-        self.assertEqual(self.files(jid, "broken")["total"], 3)
+        wait_for(lambda: self.job(jid)["status"] == "done" and self.job(jid)["broken"] == 2, timeout=15)
+        self.assertEqual(self.files(jid, "broken")["total"], 2)
+
+    def test_dead_links_inside_saved_pages_are_left_out(self):
+        jid = self.new_job("compare", "/pages/", self.target("t-pages"), types="")
+        j = self.wait_status(jid, "done", "failed")
+        log = self.files(jid)["log"]
+        self.assertEqual(j["broken"], 0, log[-10:])
+        self.assertTrue({"real name.pdf", "Saved_Page_files/logo.gif"}
+                        <= {f["path"] for f in self.files(jid)["files"]})
+        left = sorted(l.rsplit("/", 1)[-1] for l in log if l.startswith("Left out"))
+        self.assertEqual(left, ["logo.gif", "old_name.pdf", "style.css"], log[-10:])
+        self.assertTrue(any("3 dead links inside pages left out" in l for l in log), log[-3:])
 
     def test_scan_leaves_no_temp_files(self):
         before = {d for d in os.listdir(tempfile.gettempdir()) if d.startswith("wget-gui-scan-")}
@@ -903,6 +923,19 @@ class ParserTest(unittest.TestCase):
         self.assertEqual(pt("tar.gz; zip"), ["tar.gz", "zip"])
         with self.assertRaises(ValueError):
             pt("pdf;rm -rf")
+
+    def test_listing_helpers(self):
+        page = "http://h/a%20b//c/"
+        html = ('<a href="../">up</a> <a href="x%20y.pdf">1</a> <a href="sub/">2</a> '
+                '<a href="Genevi%C3%83%C2%A8ve.pdf">3</a> <a href="?C=N;O=D">sort</a>')
+        keys = wget_gui.listing_keys(page, html)
+        for url in ("http://h/a%20b/c/x%20y.pdf", "http://h/a b//c/x y.pdf", "http://h/a%20b//c/sub/",
+                    "http://h/a%20b//c/Genevi%C3%A8ve.pdf"):
+            self.assertIn(wget_gui.url_key(url), keys, url)
+        self.assertNotIn(wget_gui.url_key("http://h/a%20b//c/x_y.pdf"), keys)
+        self.assertEqual(wget_gui.parent_url("http://h/a/b%20c/d.pdf?x=1"), "http://h/a/b%20c/")
+        self.assertEqual(wget_gui.parent_url("http://h/a/b/"), "http://h/a/")
+        self.assertEqual(wget_gui.listing_keys(page, "<a href=broken"), set())
 
     def test_unmangle_url(self):
         u = wget_gui.unmangle_url
