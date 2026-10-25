@@ -8,15 +8,18 @@ Usage: python ci/notices.py <path to the bundled wget.exe> <output file>
 import os
 import subprocess
 import sys
-import urllib.request
 
-GPL_URL = "https://www.gnu.org/licenses/gpl-3.0.txt"
+# The repository's LICENSE is the FSF's GPL v3 text, the same licence wget uses.
+GPL_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "LICENSE")
 
 
 def main():
     wget, out = sys.argv[1], sys.argv[2]
     version = subprocess.run([wget, "--version"], capture_output=True, text=True).stdout.splitlines()[0]
-    gpl = urllib.request.urlopen(GPL_URL, timeout=60).read().decode("utf-8")
+    with open(GPL_FILE, encoding="utf-8") as f:
+        gpl = f.read()
+    if "GNU GENERAL PUBLIC LICENSE" not in gpl or "Version 3" not in gpl:
+        sys.exit("LICENSE is not the GPL v3 text")
     python_license = os.path.join(sys.base_prefix, "LICENSE.txt")
     with open(python_license, encoding="utf-8", errors="replace") as f:
         psf = f.read()
